@@ -1,119 +1,198 @@
 #!/bin/bash -e
 set -o pipefail
 
-deps="ninja patchelf unzip curl pip flex bison zip git perl glslangValidator python3"
+deps="git ninja patchelf unzip curl flex bison zip glslangValidator python3 ccache pkg-config"
+
 workdir="$(pwd)/turnip_workdir"
-ndkver="android-ndk-r28"
-target_sdk="35"
+ndkver="android-ndk-r29"
+ndk="$workdir/$ndkver/toolchains/llvm/prebuilt/linux-x86_64/bin"
 
-check_deps(){
-	for dep in $deps; do
-		if ! command -v $dep >/dev/null 2>&1; then echo "Missing: $dep"; exit 1; fi
-	done
-	pip install meson mako --break-system-packages &> /dev/null || true
+mesasrc="https://gitlab.freedesktop.org/mesa/mesa.git"
+srcfolder="mesa"
+
+BUILD_VERSION="${BUILD_VERSION:-${GITHUB_RUN_NUMBER:-local}}"
+
+check_deps() {
+    echo "== Checking dependencies =="
+
+    for dep in $deps; do
+        if ! command -v "$dep" >/dev/null 2>&1; then
+            echo "Missing dependency: $dep"
+            exit 1
+        fi
+    done
+
+    python3 -m pip install --break-system-packages -U meson mako packaging pyyaml
 }
 
-prepare_ndk(){
-	mkdir -p "$workdir" && cd "$workdir"
-	if [ ! -d "$ndkver" ]; then
-		curl -L "https://dl.google.com/android/repository/${ndkver}-linux.zip" --output "${ndkver}-linux.zip" &> /dev/null
-		unzip -q "${ndkver}-linux.zip" &> /dev/null
-	fi
-    export ANDROID_NDK_HOME="$workdir/$ndkver"
-}
+prepare_workdir() {
+    echo "== Preparing workdir =="
 
-compile_mesa() {
-    local repo_url="https://gitlab.freedesktop.org/mesa/mesa.git"
-    local branch="main"
-    local build_name="Turnip-Main-Clean-SDK35"
-    local output_tag="V97-Main-SDK35"
-
-    echo "Cloning Mesa Main..."
-    
+    rm -rf "$workdir"
+    mkdir -p "$workdir"
     cd "$workdir"
-    rm -rf mesa
-    
-    git clone --depth 100 -b "$branch" "$repo_url" mesa
-    cd mesa
 
-    mkdir -p subprojects && cd subprojects
-    rm -rf spirv-tools spirv-headers
-    git clone --depth=1 https://github.com/KhronosGroup/SPIRV-Tools.git spirv-tools
-    git clone --depth=1 https://github.com/KhronosGroup/SPIRV-Headers.git spirv-headers
-    cd ..
+    echo "Downloading Android NDK $ndkver..."
 
-    local build_dir="$workdir/mesa/build"
-    rm -rf "$build_dir"
+    curl -fL \
+        "https://dl.google.com/android/repository/${ndkver}-linux.zip" \
+        -o "${ndkver}-linux.zip"
 
-    local ndk_bin="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
-    local ndk_sys="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
-    local cver="35"
-    [ ! -f "$ndk_bin/aarch64-linux-android${cver}-clang" ] && cver="34"
+    unzip -q "${ndkver}-linux.zip"
 
-    cat <<EOF > android-cross.txt
+    echo "Cloning Mesa main..."
+
+    git clone \
+        --depth=1 \
+        --branch main \
+        "$mesasrc" \
+        "$srcfolder"
+}
+
+build_lib_for_android() {
+    cd "$workdir/$srcfolder"
+
+    echo "== Mesa commit =="
+    git log -1 --oneline
+
+    #
+    # Android compatibility fixes used by custom Turnip builds.
+    #
+    sed -i 's/ (%s)//g' src/freedreno/vulkan/tu_device.cc 2>/dev/null || true
+    sed -i 's/ (%s)//g' src/freedreno/vulkan/tu_device.c 2>/dev/null || true
+
+    sed -i \
+        's/typedef const native_handle_t\* buffer_handle_t;/typedef void\* buffer_handle_t;/g' \
+        include/android_stub/cutils/native_handle.h 2>/dev/null || true
+
+    sed -i \
+        's/, hnd->handle/, (void *)hnd->handle/g' \
+        src/util/u_gralloc/u_gralloc_fallback.c 2>/dev/null || true
+
+    sed -i \
+        's/native_buffer->handle->/((const native_handle_t *)native_buffer->handle)->/g' \
+        src/vulkan/runtime/vk_android.c 2>/dev/null || true
+
+    sed -i \
+        's/anb->handle->/((const native_handle_t *)anb->handle)->/g' \
+        src/vulkan/runtime/vk_android.c 2>/dev/null || true
+
+    export PATH="$ndk:$PATH"
+
+    export CC=clang
+    export CXX=clang++
+    export AR=llvm-ar
+    export RANLIB=llvm-ranlib
+    export STRIP=llvm-strip
+    export OBJDUMP=llvm-objdump
+    export OBJCOPY=llvm-objcopy
+    export LDFLAGS="-fuse-ld=lld"
+
+    GITHASH="$(git rev-parse --short HEAD)"
+
+    cver="36"
+    [ ! -f "$ndk/aarch64-linux-android${cver}-clang" ] && cver="35"
+    [ ! -f "$ndk/aarch64-linux-android${cver}-clang" ] && cver="34"
+
+    echo "Android API: $cver"
+
+    cat > android-aarch64.txt <<EOF
 [binaries]
-ar = '$ndk_bin/llvm-ar'
-c = ['ccache', '$ndk_bin/aarch64-linux-android${cver}-clang', '--sysroot=$ndk_sys']
-cpp = ['ccache', '$ndk_bin/aarch64-linux-android${cver}-clang++', '--sysroot=$ndk_sys']
-c_ld = 'lld'
-cpp_ld = 'lld'
-strip = '$ndk_bin/aarch64-linux-android-strip'
+ar = '$ndk/llvm-ar'
+c = ['ccache', '$ndk/aarch64-linux-android${cver}-clang']
+cpp = ['ccache', '$ndk/aarch64-linux-android${cver}-clang++', '-fno-exceptions', '-fno-unwind-tables', '-fno-asynchronous-unwind-tables', '--start-no-unused-arguments', '-static-libstdc++', '--end-no-unused-arguments']
+c_ld = '$ndk/ld.lld'
+cpp_ld = '$ndk/ld.lld'
+strip = '$ndk/llvm-strip'
+pkg-config = ['env', 'PKG_CONFIG_LIBDIR=/nonexistent', '/usr/bin/pkg-config']
+
 [host_machine]
 system = 'android'
 cpu_family = 'aarch64'
 cpu = 'armv8'
 endian = 'little'
-[built-in options]
-c_link_args = ['-static-libstdc++']
-cpp_link_args = ['-static-libstdc++']
 EOF
-    
-    export CFLAGS="-D__ANDROID__ -Wno-error -Wno-deprecated-declarations"
-    export CXXFLAGS="-D__ANDROID__ -Wno-error -Wno-deprecated-declarations"
 
-    meson setup "$build_dir" --cross-file android-cross.txt \
+    cat > native.txt <<EOF
+[binaries]
+c = 'clang'
+cpp = 'clang++'
+ar = 'llvm-ar'
+strip = 'llvm-strip'
+c_ld = 'ld.lld'
+cpp_ld = 'ld.lld'
+
+[host_machine]
+system = 'linux'
+cpu_family = 'x86_64'
+cpu = 'x86_64'
+endian = 'little'
+EOF
+
+    echo "== Configuring Turnip Android ARM64 MSM =="
+
+    meson setup build-android-aarch64 \
+        --cross-file android-aarch64.txt \
+        --native-file native.txt \
+        --prefix /tmp/turnip-msm \
         -Dbuildtype=release \
+        -Dstrip=true \
         -Dplatforms=android \
-        -Dplatform-sdk-version=35 \
+        -Dvideo-codecs= \
+        -Dplatform-sdk-version="$cver" \
         -Dandroid-stub=true \
         -Dgallium-drivers= \
         -Dvulkan-drivers=freedreno \
-        -Dfreedreno-kmds=kgsl \
-        -Degl=disabled \
-        -Dglx=disabled \
         -Dvulkan-beta=true \
-        -Ddefault_library=shared \
-        -Dzstd=disabled \
-        -Dwerror=false \
-        --force-fallback-for=spirv-tools,spirv-headers
-    
-    ninja -C "$build_dir"
+        -Dfreedreno-kmds=msm \
+        -Dallow-fallback-for=libdrm \
+        -Degl=disabled \
+        -Dandroid-libbacktrace=disabled
 
-    local lib="$build_dir/src/freedreno/vulkan/libvulkan_freedreno.so"
-    if [ ! -f "$lib" ]; then echo "Build Failed"; exit 1; fi
-    
-    local pkg_dir="$workdir/pkg_$output_tag"
-    mkdir -p "$pkg_dir"
-    cp "$lib" "$pkg_dir/vulkan.ad07XX.so"
-    cd "$pkg_dir"
-    patchelf --set-soname "vulkan.adreno.so" vulkan.ad07XX.so
-    
-    echo "{
-  \"schemaVersion\": 1,
-  \"name\": \"$build_name\",
-  \"description\": \"Mesa Main Clean Build (SDK 35)\",
-  \"author\": \"StevenMX\",
-  \"packageVersion\": \"1\",
-  \"vendor\": \"Mesa\",
-  \"driverVersion\": \"$output_tag\",
-  \"minApi\": 28,
-  \"libraryName\": \"vulkan.ad07XX.so\"
-}" > meta.json
-    
-    zip -9 "$workdir/Turnip-${output_tag}.zip" vulkan.ad07XX.so meta.json
-    echo "Done: Turnip-${output_tag}.zip"
+    echo "== Building =="
+
+    ninja -C build-android-aarch64 install
+
+    DRIVER="/tmp/turnip-msm/lib/libvulkan_freedreno.so"
+
+    if [ ! -s "$DRIVER" ]; then
+        echo "ERROR: libvulkan_freedreno.so was not generated."
+        exit 1
+    fi
+
+    echo "== Driver generated =="
+    ls -lh "$DRIVER"
+    sha256sum "$DRIVER"
+
+    cd /tmp/turnip-msm/lib
+
+    cat > meta.json <<EOF
+{
+  "schemaVersion": 1,
+  "name": "StevenMXZ A6xx/A7xx MSM ${BUILD_VERSION}",
+  "description": "Mesa Turnip Android ARM64 adapted for Armada OS / Waydroid MSM DRM",
+  "author": "StevenMXZ fork / Armada MSM build",
+  "packageVersion": "1",
+  "vendor": "Mesa",
+  "driverVersion": "Mesa-${GITHASH}-MSM",
+  "minApi": 28,
+  "libraryName": "libvulkan_freedreno.so"
+}
+EOF
+
+    ZIP="/tmp/turnip-msm-V${BUILD_VERSION}.zip"
+
+    zip -9 "$ZIP" \
+        libvulkan_freedreno.so \
+        meta.json
+
+    cp "$ZIP" "$workdir/"
+
+    echo "== Finished =="
+    ls -lh "$workdir"/*.zip
+    unzip -l "$workdir/$(basename "$ZIP")"
 }
 
 check_deps
-prepare_ndk
-compile_mesa
+prepare_workdir
+build_lib_for_android
