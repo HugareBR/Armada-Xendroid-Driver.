@@ -26,8 +26,16 @@ jobs:
             git \
             perl \
             python3-pip \
-            glslang-tools
-          pip3 install --break-system-packages meson mako
+            glslang-tools \
+            ccache \
+            clang \
+            lld \
+            llvm \
+            pkg-config \
+            curl \
+            zip
+
+          pip3 install --break-system-packages meson mako packaging pyyaml
 
       - name: Build
         run: |
