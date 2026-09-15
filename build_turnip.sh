@@ -5,14 +5,14 @@ deps="git meson ninja patchelf unzip curl pip flex bison zip glslangValidator py
 workdir="$(pwd)/turnip_workdir"
 ndkver="android-ndk-r29"
 ndk="$workdir/$ndkver/toolchains/llvm/prebuilt/linux-x86_64/bin"
-mesasrc="https://github.com/whitebelyash/mesa-tu8.git"
+mesasrc="https://gitlab.freedesktop.org/mesa/mesa.git"
 srcfolder="mesa"
 BUILD_VERSION="${BUILD_VERSION:-1.0}"
 
 run_all(){
     check_deps
     prepare_workdir
-    build_lib_for_android gen8
+    build_lib_for_android main
 }
 
 check_deps(){
@@ -36,7 +36,6 @@ prepare_workdir(){
     git clone "$mesasrc" --depth=1 --no-single-branch "$srcfolder"
     cd "$srcfolder"
     
-    echo "#define TUGEN8_DRV_VERSION \"\"" > ./src/freedreno/vulkan/tu_version.h
 }
 
 build_lib_for_android(){
@@ -46,7 +45,6 @@ build_lib_for_android(){
     sed -i 's/ (%s)//g' src/freedreno/vulkan/tu_device.cc || true
     sed -i 's/ (%s)//g' src/freedreno/vulkan/tu_device.c || true
 
-    sed -i '/a7xx_gen1 = GPUProps(/a \        has_early_preamble = False,' src/freedreno/common/freedreno_devices.py || true
     sed -i 's/typedef const native_handle_t\* buffer_handle_t;/typedef void\* buffer_handle_t;/g' include/android_stub/cutils/native_handle.h || true
     sed -i 's/, hnd->handle/, (void \*)hnd->handle/g' src/util/u_gralloc/u_gralloc_fallback.c || true
     sed -i 's/native_buffer->handle->/((const native_handle_t \*)native_buffer->handle)->/g' src/vulkan/runtime/vk_android.c || true
@@ -115,7 +113,8 @@ EOF
         -Dgallium-drivers= \
         -Dvulkan-drivers=freedreno \
         -Dvulkan-beta=true \
-        -Dfreedreno-kmds=kgsl \
+        -Dfreedreno-kmds=msm \
+        -Dallow-fallback-for=libdrm \
         -Degl=disabled \
         -Dandroid-libbacktrace=disabled
 
@@ -130,8 +129,8 @@ EOF
     cat <<EOF >"meta.json"
 {
   "schemaVersion": 1,
-  "name": "Turnip Gen8 V29",
-  "description": "A8xx support",
+  "name": "StevenMXZ Turnip MSM V$BUILD_VERSION",
+  "description": "Mesa Turnip A6xx/A7xx adapted for Armada OS Waydroid MSM/DRM",
   "author": "stevenmx",
   "packageVersion": "1",
   "vendor": "Mesa",
@@ -141,8 +140,8 @@ EOF
 }
 EOF
 
-    zip -9 "/tmp/a8xx-$1-V${BUILD_VERSION}.zip" libvulkan_freedreno.so meta.json
-    cp "/tmp/a8xx-$1-V${BUILD_VERSION}.zip" "$workdir/"
+    zip -9 "/tmp/turnip-msm-V${BUILD_VERSION}.zip" libvulkan_freedreno.so meta.json
+    cp "/tmp/turnip-msm-V${BUILD_VERSION}.zip" "$workdir/"
 }
 
 run_all
